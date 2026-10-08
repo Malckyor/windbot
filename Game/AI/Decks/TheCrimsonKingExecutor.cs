@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using WindBot;
 using WindBot.Game;
@@ -641,7 +642,16 @@ namespace WindBot.Game.AI.Decks
             _backgroundStartedThisTurn = false;
             _backgroundPlan = null;
             _backgroundRoot = null;
+            CancelBackgroundPlan();
             base.OnNewTurn();
+        }
+
+        public override void OnDuelEnd()
+        {
+            // Fim do duelo: qualquer busca em segundo plano ainda rodando não tem mais sentido e só ocuparia CPU
+            // enquanto o processo se prepara para a próxima partida (P4).
+            CancelBackgroundPlan();
+            base.OnDuelEnd();
         }
 
         public override void OnNewPhase()
@@ -934,7 +944,8 @@ namespace WindBot.Game.AI.Decks
         }
 
         // Monstros LIGHT/DARK de uma lista do oponente (GY/banidas), registrados no modelo como cartas de fora.
-        private static int[] EnemyLightDarkMonsters(IEnumerable<ClientCard> cards)
+        // Os valores vivos de cada carta entram no overlay 'foreign' da duel (lido pelas regras), nunca no cache estático.
+        private static int[] EnemyLightDarkMonsters(IEnumerable<ClientCard> cards, Dictionary<int, ForeignLive> foreign)
         {
             var result = new List<int>();
             foreach (ClientCard card in cards)
@@ -945,12 +956,21 @@ namespace WindBot.Game.AI.Decks
                     continue;
                 int code = CardCode(card);
                 if (!IsModeled(code))
-                    RdaCards.RegisterForeign(code, card.Name ?? ("#" + code), card.Level, (CardAttribute)card.Attribute, (CardRace)card.Race,
-                        card.IsTuner(), card.HasType(CardType.Synchro));
+                    RdaCards.RegisterForeign(code, card.Name ?? ("#" + code));
+                RememberForeignLive(foreign, code, card);
                 result.Add(code);
             }
             result.Sort();
             return result.ToArray();
+        }
+
+        // Overlay da duel para uma carta de fora: só entra se o modelo marcou a carta como de fora (as nossas ficam
+        // com o modelo estático, cujos valores de impressão são imutáveis e valem para sempre).
+        private static void RememberForeignLive(Dictionary<int, ForeignLive> foreign, int code, ClientCard card)
+        {
+            RdaCardInfo info = RdaCards.Get(code);
+            if (info != null && info.Foreign)
+                foreign[code] = new ForeignLive(card.Level, (CardAttribute)card.Attribute, (CardRace)card.Race, card.IsTuner());
         }
 
         // PURPOSE: montar o RdaState do nosso lado agora.
@@ -967,6 +987,8 @@ namespace WindBot.Game.AI.Decks
             }
 
             // Monstros: nível atual, se está na Zona de Monstros Extra (sequência 5 ou 6) e se está negado.
+            // Overlay com os valores vivos das cartas de fora desta leitura (consultado pelas regras; ver ForeignDynamic).
+            var foreignDynamic = new Dictionary<int, ForeignLive>();
             var field = new List<long>();
             for (int seq = 0; seq < Bot.MonsterZone.Length; ++seq)
             {
@@ -979,10 +1001,10 @@ namespace WindBot.Game.AI.Decks
                     // Monstro que não é do nosso deck no nosso campo (token do Nibiru, monstro que o oponente deixou):
                     // ocupa zona, conta nas condições de campo (Crimson Resonator, Power Vice...) e pode ser material ou
                     // custo (Bone). Antes ele era ignorado e o plano tentava ações que o jogo não oferecia.
-                    if (RdaCards.RegisterForeign(code, card.Name ?? ("#" + code), card.Level, (CardAttribute)card.Attribute, (CardRace)card.Race,
-                        card.IsTuner(), card.HasType(CardType.Synchro)))
+                    if (RdaCards.RegisterForeign(code, card.Name ?? ("#" + code)))
                         Report("interaction", string.Format("monster outside our deck on the field joins the plan: {0} (Level {1})", card.Name ?? ("#" + code), card.Level));
                 }
+                RememberForeignLive(foreignDynamic, code, card);
                 field.Add(RdaField.Encode(code, card.Level, seq >= 5, card.IsDisabled()));
             }
 
@@ -1011,8 +1033,8 @@ namespace WindBot.Game.AI.Decks
             bool enemyDarkLevel5 = enemyMonsters.Any(card => !card.HasType(CardType.Xyz) && !card.HasType(CardType.Link)
                 && card.Level >= 5 && (card.Attribute & (int)CardAttribute.Dark) != 0);
             bool fieldZoneCard = Bot.SpellZone[5] != null || Enemy.SpellZone[5] != null;
-            int[] enemyGrave = EnemyLightDarkMonsters(Enemy.Graveyard);
-            int[] enemyBanished = EnemyLightDarkMonsters(Enemy.Banished.Where(card => card != null && card.IsFaceup()));
+            int[] enemyGrave = EnemyLightDarkMonsters(Enemy.Graveyard, foreignDynamic);
+            int[] enemyBanished = EnemyLightDarkMonsters(Enemy.Banished.Where(card => card != null && card.IsFaceup()), foreignDynamic);
             int enemyBanishedOther = Math.Max(0, Enemy.Banished.Count(card => card != null) - enemyBanished.Length);
             ClientCard bestGraveTarget = Enemy.Graveyard.Where(card => card != null && Array.IndexOf(enemyGrave, CardCode(card)) >= 0)
                 .OrderByDescending(MagnamhutTargetValue).FirstOrDefault();
@@ -1070,7 +1092,8 @@ namespace WindBot.Game.AI.Decks
                 RedRisingGraveReady = redRisingGraveReady,
                 BattleWipeReady = battleWipeReady,
                 GaiaNegated = gaiaNegated,
-                SecondTurnOrLater = secondTurnOrLater
+                SecondTurnOrLater = secondTurnOrLater,
+                ForeignDynamic = foreignDynamic.Count > 0 ? foreignDynamic : null
             };
         }
 
@@ -1241,6 +1264,10 @@ namespace WindBot.Game.AI.Decks
         private RdaState _backgroundRoot;
         private System.Diagnostics.Stopwatch _backgroundWatch;
         private bool _backgroundStartedThisTurn;
+        // Cancelamento da busca em segundo plano (P4): o token só é observado pelos Plan da tarefa; quando a busca
+        // não serve mais (estado mudou, turno virou, replan limit, fim do duelo) o cancelamento faz os Plan pararem
+        // no próximo ponto de checagem em vez de gastar o orçamento inteiro de CPU atoa.
+        private CancellationTokenSource _backgroundCts;
 
         public override void OnDraw(int player)
         {
@@ -1257,11 +1284,25 @@ namespace WindBot.Game.AI.Decks
             RdaState root = ReadState();
             if (root.Pending.Length != 0)
                 return;
-            List<SearchOptions> searches = PortfolioSearches.Take(PortfolioCount).ToList();
             _backgroundRoot = root;
             _backgroundWatch = System.Diagnostics.Stopwatch.StartNew();
+            _backgroundCts = new CancellationTokenSource();
+            CancellationToken token = _backgroundCts.Token;
+            // A carteira roda com as opções clonadas carregando o token desta execução; as SearchOptions estáticas e
+            // compartilhadas ficam intactas (ver SearchOptions.Token / WithToken).
+            List<SearchOptions> searches = PortfolioSearches.Take(PortfolioCount).Select(o => o.WithToken(token)).ToList();
             _backgroundPlan = System.Threading.Tasks.Task.Run(() => RdaPlanner.PlanPortfolio(root, searches, null));
             Report("plan", "first plan of the turn started calculating in the background (" + reason + ")");
+        }
+
+        // Cancela a busca em segundo plano ainda ativa (se houver). O CTS é zerado antes do Cancel para que uma nova
+        // busca iniciada em seguida não conviva com o cancelamento da anterior; Cancel numa source já cancelada é inócuo.
+        private void CancelBackgroundPlan()
+        {
+            CancellationTokenSource source = _backgroundCts;
+            _backgroundCts = null;
+            if (source != null)
+                source.Cancel();
         }
 
         // O estado usado no cálculo é o mesmo da Main Phase? Compara também o que fica fora do Equals.
@@ -1276,7 +1317,26 @@ namespace WindBot.Game.AI.Decks
                 && a.EnemyBanishedOther == b.EnemyBanishedOther && a.EnemyGravePriority == b.EnemyGravePriority
                 && a.RedZoneReady == b.RedZoneReady && a.RedRisingGraveReady == b.RedRisingGraveReady
                 && a.BattleWipeReady == b.BattleWipeReady && a.GaiaNegated == b.GaiaNegated
-                && a.SecondTurnOrLater == b.SecondTurnOrLater;
+                && a.SecondTurnOrLater == b.SecondTurnOrLater
+                && SameForeignDynamic(a.ForeignDynamic, b.ForeignDynamic);
+        }
+
+        // Overlay vivo de cartas de fora idêntico entre duas leituras (mesmas cartas, mesmos valores): se um efeito
+        // mudou nível/atributo/raça/tuner entre as leituras, a raiz antiga não serve mais e precisa replanejar.
+        private static bool SameForeignDynamic(Dictionary<int, ForeignLive> a, Dictionary<int, ForeignLive> b)
+        {
+            if (ReferenceEquals(a, b)) return true;
+            if (a == null || b == null || a.Count != b.Count) return false;
+            foreach (KeyValuePair<int, ForeignLive> entry in a)
+            {
+                ForeignLive other;
+                if (!b.TryGetValue(entry.Key, out other)) return false;
+                ForeignLive live = entry.Value;
+                if (live.Level != other.Level || live.Attribute != other.Attribute
+                    || live.Race != other.Race || live.Tuner != other.Tuner)
+                    return false;
+            }
+            return true;
         }
 
         private RdaPlan TakeBackgroundPlan(RdaState real, ICollection<string> blocked)
@@ -1290,6 +1350,7 @@ namespace WindBot.Game.AI.Decks
             if ((blocked != null && blocked.Count > 0) || !SameRoot(root, real))
             {
                 Report("plan", "background plan discarded: the state changed after the calculation started");
+                CancelBackgroundPlan();
                 return null;
             }
             long elapsedAtMenu = _backgroundWatch.ElapsedMilliseconds;
@@ -1314,6 +1375,9 @@ namespace WindBot.Game.AI.Decks
             if (++_replansThisTurn > MaxReplansPerTurn)
             {
                 _plannerDisabledThisTurn = true;
+                _backgroundPlan = null;
+                _backgroundRoot = null;
+                CancelBackgroundPlan();
                 Report("plan", "replan limit reached, planner disabled for this turn");
                 return false;
             }
@@ -4707,7 +4771,10 @@ namespace WindBot.Game.AI.Decks
         // =====================================================================================================
         // MEMÓRIA ENTRE PARTIDAS
         //
-        // O processo morre no fim de cada duelo, então o que ele aprende tem que ir para arquivo. O formato é uma
+        // O processo morre no fim de cada duelo, então o que ele aprende tem que ir para arquivo. Ele mora em
+        // WindBot_knowledge\, pasta propria ao lado do executavel (antes vivia escondido dentro de Dialogs
+        // com nome de arquivo de traducao), e o nome vem do PRIMEIRO nome do [Deck(...)] mais "_knowledge":
+        // TheCrimsonKing -> TheCrimsonKing_knowledge.json. O formato é uma
         // linha JSON por registro, o que dá três coisas de que precisamos: dá para APENDAR sem reescrever nada
         // (não se perde dado se o processo morrer no meio), dá para ler sem biblioteca nenhuma (o esquema é fixo
         // e nosso, então os campos saem por busca de texto — o JavaScriptSerializer existe mas gastou 137 ms num
@@ -4734,9 +4801,9 @@ namespace WindBot.Game.AI.Decks
         // sem recompilar nada:
         //   1. Arquivos marcadores, ao lado do proprio arquivo de memoria. Criar ou apagar e o liga/desliga
         //      do dia a dia, sem recompilar:
-        //        Dialogs	thecrimsonking.pt-BR.json.off        memoria INTEIRA desligada: nao le e nao escreve
-        //        Dialogs	thecrimsonking.pt-BR.json.nodecide   continua COLETANDO, mas nenhuma regra consulta
-        //        Dialogs	thecrimsonking.pt-BR.json.decide     forca a consulta, mesmo com a constante em false
+        //        WindBot_knowledge\TheCrimsonKing_knowledge.json.off        memoria INTEIRA desligada: nao le e nao escreve
+        //        WindBot_knowledge\TheCrimsonKing_knowledge.json.nodecide   continua COLETANDO, mas nenhuma regra consulta
+        //        WindBot_knowledge\TheCrimsonKing_knowledge.json.decide     forca a consulta, mesmo com a constante em false
         //      O ".off" vence os outros dois. O ".decide" existe para o caso inverso do ".nodecide": sem ele,
         //      uma constante compilada em false nao teria como ser religada de fora.
         //   2. As duas constantes abaixo, que sao apenas o PADRAO quando nao ha arquivo marcador.
@@ -4795,8 +4862,20 @@ namespace WindBot.Game.AI.Decks
             }
         }
 
-        private const string KnowledgeFolder = "Dialogs";
-        private const string KnowledgeName = "thecrimsonking.pt-BR";
+        // Pasta propria ao lado do executavel; a memoria nao se esconde mais em Dialogs. O nome do arquivo e o
+        // PRIMEIRO nome do [Deck(...)] (o mesmo que o Deck=... aceita) mais o sufixo "_knowledge" — se o deck
+        // for renomeado, o arquivo acompanha. Os marcadores ".off"/".nodecide"/".decide" ficam ao lado, com o
+        // mesmo nome acrescido do sufixo.
+        private const string KnowledgeFolder = "WindBot_knowledge";
+        private static readonly string KnowledgeName = KnowledgeDeckName() + "_knowledge";
+
+        private static string KnowledgeDeckName()
+        {
+            object[] attributes = typeof(TheCrimsonKingExecutor).GetCustomAttributes(typeof(DeckAttribute), false);
+            if (attributes.Length > 0 && !string.IsNullOrEmpty(((DeckAttribute)attributes[0]).Name))
+                return ((DeckAttribute)attributes[0]).Name;
+            return "TheCrimsonKing";
+        }
         // Resultado ruim para nós. Fica curto porque vai em toda linha do arquivo.
         private const string OutcomeSeen = "-";        // denominador: a carta resolveu neste duelo
         // Numerador: UM rótulo só para "deu ruim para nós", seja plano desabado ou efeito nosso negado. Dois
@@ -4869,8 +4948,74 @@ namespace WindBot.Game.AI.Decks
             return System.IO.Path.Combine(dir, KnowledgeName + ".json");
         }
 
-        // Toda gravação é engolida: memória é melhoria, nunca requisito. Sem a pasta, sem permissão ou com o
-        // arquivo em uso, o bot joga igual ao de antes.
+        // Teto da fila de pendentes. Enquanto a escrita falha, os lotes são RETIDOS para o próximo flush (nada
+        // se perde mais em silêncio), mas uma falha prolongada cresceria sem limite — passado o teto, descartam-
+        // se os registros mais antigos (de duelos mais velhos) com um único aviso por duelo.
+        private const int KnowledgePendingMax = 4096;
+
+        // Coordenação de escrita. O MESMO arquivo é apendado por várias instâncias no mesmo processo (modo server,
+        // um executor por thread) e por vários processos na mesma pasta. Mutex nomeado, derivado de um hash
+        // estável do path — Mutex não aceita '\' no nome, e string.GetHashCode varia entre runtimes. Um segurador
+        // travado não pode congelar os outros: timeout, lote retido, retry no próximo flush. AbandonedMutexException
+        // (detentor morreu no meio) significa que o mutex foi liberado pelo sistema e tomamos na chamada.
+        //
+        // Os dois mutáveis (e não const) são como SearchOptions no template: existem para os testes ajustarem por
+        // reflexão, sem trocar o comportamento em produção.
+        private static int KnowledgeLockTimeoutMs = 5000;
+        private static long KnowledgeCompactBytes = 4L * 1024 * 1024;
+        private static readonly string KnowledgeLockName = KnowledgeMutexNameFor(KnowledgePath());
+        private static readonly System.Threading.Mutex KnowledgeMutex = CreateKnowledgeMutex();
+
+        private static string KnowledgeMutexNameFor(string path)
+        {
+            // FNV-1a de 64 bits: determinístico entre processos e entre runtimes (.NET Framework e Mono).
+            unchecked
+            {
+                ulong hash = 14695981039346656037UL;
+                for (int i = 0; i < path.Length; ++i)
+                {
+                    hash ^= path[i];
+                    hash *= 1099511628211UL;
+                }
+                return "WindBot_knowledge_" + hash.ToString("x16");
+            }
+        }
+
+        private static System.Threading.Mutex CreateKnowledgeMutex()
+        {
+            try { return new System.Threading.Mutex(false, KnowledgeLockName); }
+            catch { return null; }   // ambiente sem mutex nomeado: segue sem coordenação cross-processo
+        }
+
+        // true = segurou (ou não há mutex para segurar); false = outro escritor não soltou em KnowledgeLockTimeoutMs.
+        private static bool KnowledgeLock()
+        {
+            if (KnowledgeMutex == null) return true;
+            try { return KnowledgeMutex.WaitOne(KnowledgeLockTimeoutMs); }
+            catch (System.Threading.AbandonedMutexException) { return true; }
+            catch { return false; }
+        }
+
+        private static void KnowledgeUnlock()
+        {
+            if (KnowledgeMutex == null) return;
+            try { KnowledgeMutex.ReleaseMutex(); }
+            catch { }   // liberar demais é bug nosso, não motivo para derrubar o duelo
+        }
+
+        // Memória é melhoria, nunca requisito: falha de gravação não derruba o duelo. MAS a falha também não pode
+        // DESCARTAR o lote — o catch vazio somado ao Clear() perdia os registros para sempre, e os flags de "uma
+        // vez por duelo" já consumidos impediam que o lote fosse regenerado. Agora o lote fica pendente até um
+        // flush bem-sucedido; o aviso é único por duelo para o log não virar ruído.
+        private bool _knowledgeWriteNotice;
+
+        private void KnowledgeWriteNotice(string message)
+        {
+            if (_knowledgeWriteNotice) return;
+            _knowledgeWriteNotice = true;
+            Report("opponent", message);
+        }
+
         private void KnowledgeAppend(string outcome, int cardId)
         {
             if (string.IsNullOrEmpty(_knowledgeArchetype) || cardId == 0 || !KnowledgeEnabled)
@@ -4887,6 +5032,12 @@ namespace WindBot.Game.AI.Decks
             if (signature != null)
                 _knowledgePending.Add(string.Format(
                     "{{\"a\":\"{0}\",\"o\":\"{1}\",\"c\":0,\"n\":1}}", signature, outcome));
+            if (_knowledgePending.Count > KnowledgePendingMax)
+            {
+                _knowledgePending.RemoveRange(0, _knowledgePending.Count - KnowledgePendingMax);
+                KnowledgeWriteNotice("pendentes no teto de " + KnowledgePendingMax
+                    + " linha(s): descartados os registros mais antigos");
+            }
             if (_knowledgePending.Count < KnowledgeFlushAt)
                 return;
             KnowledgeFlush();
@@ -4984,10 +5135,11 @@ namespace WindBot.Game.AI.Decks
         private void KnowledgeNewDuel()
         {
             _lastLifePoints = 0;
-            KnowledgeFlush();
+            KnowledgeFlush();   // retry natural: os pendentes de falhas do duelo anterior tentam gravar aqui
             _opponentResolvedThisDuel.Clear();
             _knowledgeOutcomesThisDuel.Clear();
             _knowledgeSeenWritten.Clear();
+            _knowledgeWriteNotice = false;
             _planCollapseRecorded = false;
             _lastPlanTier = -1;
         }
@@ -5061,19 +5213,60 @@ namespace WindBot.Game.AI.Decks
                     "memory: {0} different route(s) lead to our trouble here, so cutting one does not stop it", routes));
         }
 
+        // Escreve os pendentes sob o mutex cross-processo. A fila só limpa em SUCESSO: antes, exceção engolida +
+        // Clear() perdia o lote inteiro para sempre. Em falha os pendentes ficam e o próximo flush (a cada 16
+        // registros, em cada desfecho e no início do duelo seguinte) tenta de novo. A compactação por tamanho roda
+        // aqui porque um processo que vive muitos duelos sem morrer só cresce por apends — o load cobre só o
+        // startup. Pasta ausente agora é criada: antes pular a escrita e limpar a fila assim mesmo era perda total.
         private void KnowledgeFlush()
         {
             if (_knowledgePending.Count == 0)
                 return;
+            if (_knowledgePending.Count > KnowledgePendingMax)
+            {
+                _knowledgePending.RemoveRange(0, _knowledgePending.Count - KnowledgePendingMax);
+                KnowledgeWriteNotice("pendentes no teto de " + KnowledgePendingMax
+                    + " linha(s): descartados os registros mais antigos");
+            }
+            if (!KnowledgeLock())
+            {
+                KnowledgeWriteNotice("outro escritor segura o arquivo — " + _knowledgePending.Count
+                    + " linha(s) retidas para o próximo flush");
+                return;
+            }
+            bool written = false;
             try
             {
                 string path = KnowledgePath();
-                string dir = System.IO.Path.GetDirectoryName(path);
-                if (!string.IsNullOrEmpty(dir) && System.IO.Directory.Exists(dir))
+                try
+                {
+                    string dir = System.IO.Path.GetDirectoryName(path);
+                    if (!string.IsNullOrEmpty(dir))
+                        System.IO.Directory.CreateDirectory(dir);
                     System.IO.File.AppendAllLines(path, _knowledgePending);
+                    written = true;
+                }
+                catch (Exception e)
+                {
+                    KnowledgeWriteNotice("falha ao gravar " + _knowledgePending.Count + " linha(s) ("
+                        + e.GetType().Name + ") — retidas para o próximo flush");
+                }
+                if (written)
+                {
+                    try
+                    {
+                        if (new System.IO.FileInfo(path).Length >= KnowledgeCompactBytes)
+                            KnowledgeCompact(-1);
+                    }
+                    catch { }   // o apend já gravou: compactação é melhor esforço e falha mantê-lo-ia intacto
+                }
             }
-            catch { }
-            _knowledgePending.Clear();
+            finally
+            {
+                KnowledgeUnlock();
+            }
+            if (written)
+                _knowledgePending.Clear();
         }
 
         // Agregado carregado uma vez por processo: (arquétipo|carta) -> vezes vista, e (arquétipo|carta|resultado)
@@ -5097,61 +5290,111 @@ namespace WindBot.Game.AI.Decks
             return stop > at ? line.Substring(at, stop - at) : null;
         }
 
+        // Uma linha do arquivo -> uma entrada agregada. Usada no load e na releitura da compactação; os dois
+        // caminhos precisam calcular a chave IGUAL, senão a taxa de repetição e os totais erram.
+        private static bool KnowledgeCountLine(Dictionary<string, int> counts, string line)
+        {
+            if (line.Length < 10)
+                return false;
+            string archetype = Field(line, "a"), outcome = Field(line, "o"), card = Field(line, "c"), count = Field(line, "n");
+            if (archetype == null || outcome == null || card == null)
+                return false;
+            int add;
+            if (!int.TryParse(count, out add))
+                add = 1;
+            string key = archetype + "|" + card + "|" + outcome;
+            int current;
+            counts.TryGetValue(key, out current);
+            counts[key] = current + add;
+            return true;
+        }
+
         private void KnowledgeLoad()
         {
             lock (_knowledgeLock)
             {
                 if (_knowledgeCounts != null)
                     return;
-                _knowledgeCounts = new Dictionary<string, int>(StringComparer.Ordinal);
                 if (!KnowledgeEnabled)
+                {
+                    _knowledgeCounts = new Dictionary<string, int>(StringComparer.Ordinal);
                     return;
-                int lines = 0;
+                }
+                // Ler e compactar no MESMO mutex: soltar no meio deixaria outro processo apendear entre a
+                // leitura e a reescrita. A guarda "!= null" é uma vez por processo, então o timeout não pode
+                // simplesmente devolver sem publicar — senão a memória ficaria desligada para o processo todo
+                // (a próxima chamada pularia). Publicar vazio mantém o comportamento do catch de leitura.
+                if (!KnowledgeLock())
+                {
+                    _knowledgeCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+                    return;
+                }
                 try
                 {
-                    string path = KnowledgePath();
-                    if (!System.IO.File.Exists(path))
-                        return;
-                    foreach (string line in System.IO.File.ReadLines(path))
+                    var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+                    int lines = 0;
+                    try
                     {
-                        if (line.Length < 10)
-                            continue;
-                        string archetype = Field(line, "a"), outcome = Field(line, "o"), card = Field(line, "c"), count = Field(line, "n");
-                        if (archetype == null || outcome == null || card == null)
-                            continue;
-                        int add;
-                        if (!int.TryParse(count, out add))
-                            add = 1;
-                        string key = archetype + "|" + card + "|" + outcome;
-                        int current;
-                        _knowledgeCounts.TryGetValue(key, out current);
-                        _knowledgeCounts[key] = current + add;
-                        lines++;
+                        string path = KnowledgePath();
+                        if (System.IO.File.Exists(path))
+                            foreach (string line in System.IO.File.ReadLines(path))
+                                if (KnowledgeCountLine(counts, line))
+                                    lines++;
                     }
+                    catch { }
+                    _knowledgeCounts = counts;
+                    if (lines > 0)
+                        Report("opponent", string.Format("memory: {0} record(s) read, {1} distinct key(s)",
+                            lines, counts.Count));
+                    KnowledgeCompact(lines);
                 }
-                catch { }
-                if (lines > 0)
-                    Report("opponent", string.Format("memory: {0} record(s) read, {1} distinct key(s)", lines, _knowledgeCounts.Count));
-                KnowledgeCompact(lines);
+                finally
+                {
+                    KnowledgeUnlock();
+                }
             }
         }
 
         // O arquivo é apendável de propósito — é isso que o torna à prova de o processo morrer no meio do duelo.
         // O preço é que a mesma chave se repete a cada partida. A compactação reescreve uma linha por chave, com
-        // o total no campo "n", e só roda quando a repetição passa do limite, para não gastar escrita à toa.
+        // o total no campo "n".
         //
         // Isto não existia até 2026-09-23: o arquivo tinha chegado a 9.793 linhas e 423 KB com 1.478 chaves
         // distintas, ou seja, mais de 6 linhas por chave. Depois de compactar são 1.478 linhas.
+        //
+        // O CHAMADOR segura o mutex (load ou flush). Duas regras contra as perdas silenciosas conhecidas:
+        //   1. a escrita parte de uma RELEITURA do arquivo, nunca do snapshot do load — reescrever a partir da
+        //      memória apagava tudo que outros processos gravaram desde o nosso load;
+        //   2. grava em .tmp e troca com File.Replace: o arquivo nunca fica truncado no meio, e falha na troca
+        //      mantê-lo-ia intacto. A memória passa a ser exatamente essa releitura — o "recarregar" custa zero
+        //      (são os bytes já lidos) e é o que faz o processo enxergar o que os outros gravaram.
+        //
+        // lines < 0 = disparo por tamanho (flush): aí a razão de repetição não serve, porque lines seria o
+        // número do load, não o do arquivo atual.
         private const int KnowledgeCompactRatio = 3;
 
         private void KnowledgeCompact(int lines)
         {
-            if (_knowledgeCounts.Count == 0 || lines <= _knowledgeCounts.Count * KnowledgeCompactRatio)
-                return;
+            string path = KnowledgePath();
             try
             {
-                var compacted = new List<string>(_knowledgeCounts.Count);
-                foreach (var entry in _knowledgeCounts)
+                if (lines >= 0)
+                {
+                    int distinct = _knowledgeCounts != null ? _knowledgeCounts.Count : 0;
+                    if (lines <= distinct * KnowledgeCompactRatio)
+                        return;
+                }
+                if (!System.IO.File.Exists(path))
+                    return;
+                var fresh = new Dictionary<string, int>(StringComparer.Ordinal);
+                int freshLines = 0;
+                foreach (string line in System.IO.File.ReadLines(path))
+                    if (KnowledgeCountLine(fresh, line))
+                        freshLines++;
+                if (freshLines == 0)
+                    return;   // arquivo sumiu ou virou lixo sob nós: aborta, memória e original intactos
+                var compacted = new List<string>(fresh.Count);
+                foreach (var entry in fresh)
                 {
                     // A chave é "arquétipo|carta|resultado". O arquétipo pode ter qualquer coisa dentro, então o
                     // corte é feito da DIREITA para a esquerda, onde os dois campos são conhecidos.
@@ -5165,8 +5408,22 @@ namespace WindBot.Game.AI.Decks
                     compacted.Add(string.Format("{{\"a\":\"{0}\",\"o\":\"{1}\",\"c\":{2},\"n\":{3}}}",
                         archetype, outcome, card, entry.Value));
                 }
-                System.IO.File.WriteAllLines(KnowledgePath(), compacted);
-                Report("opponent", string.Format("memory: compacted {0} line(s) into {1}", lines, compacted.Count));
+                if (compacted.Count == 0)
+                    return;
+                string temp = path + ".tmp";
+                System.IO.File.WriteAllLines(temp, compacted);
+                try
+                {
+                    System.IO.File.Replace(temp, path, null);
+                }
+                catch
+                {
+                    try { System.IO.File.Delete(temp); }
+                    catch { }
+                    return;
+                }
+                _knowledgeCounts = fresh;
+                Report("opponent", string.Format("memory: compacted {0} line(s) into {1}", freshLines, fresh.Count));
             }
             catch { }
         }
@@ -5789,14 +6046,48 @@ namespace WindBot.Game.AI.Decks
 
         private static class RdaScripts
         {
+            // Limites contra ZIP malicioso (zip bomb). Script de carta real é poucos KB — o maior c*.lua medido em
+            // MDPro3/script.zip (2026-10-07) tem 8 KB e o maior arquivo do archive, procedure.lua, 87 KB — então
+            // 512 KB já é folga enorme. O limite é DUAS camadas: a primeira confia no tamanho declarado no
+            // cabeçalho do ZIP (recusa barata, mas o cabeçalho pode mentir), a segunda mede os bytes que a stream
+            // entrega de fato (a garantia real). Sem a segunda, um ZIP com cabeçalho falso passa pela primeira.
+            private const int MaxEntryBytes = 512 * 1024;
+            // Tamanho do script.zip comprimido no disco: só sanidade (o real tem 13 MB); zip bomb cabe em arquivo
+            // pequeno, quem segura o bomb é MaxEntryBytes.
+            private const long MaxArchiveBytes = 256L * 1024 * 1024;
+            // Máximo de entradas indexadas (o real tem 13527): impede Prepare de varrer archive absurdo sob o Gate.
+            private const int MaxEntries = 65536;
+
             private static readonly object Gate = new object();
             private static bool _prepared;
             private static object _archive;                        // System.IO.Compression.ZipArchive
             private static Dictionary<string, object> _entries;    // "c123.lua" -> ZipArchiveEntry
             private static System.Reflection.MethodInfo _openEntry;
+            private static System.Reflection.PropertyInfo _entryLength; // ZipArchiveEntry.Length (tamanho declarado)
 
-            // Sobe no máximo 6 níveis a partir da pasta do executável procurando o script.zip do cliente.
-            private static string Locate()
+            // Caminho explícito e confiável, se configurado. Config.Load pode não ter sido chamado (teste por
+            // reflexão carrega só o assembly) — daí o try/catch: sem config, quem manda é a busca legada.
+            // isConfigured distingue "chave ausente" (busca legada vale) de "chave presente mas arquivo não
+            // existe" (local explícito é exclusivo: não volta para a busca ampla).
+            private static string ConfiguredPath(out bool isConfigured)
+            {
+                isConfigured = false;
+                string configured;
+                try { configured = WindBot.Config.GetString("SCRIPTZIP"); }
+                catch { return null; }
+                if (string.IsNullOrEmpty(configured))
+                    return null;
+                isConfigured = true;
+                try
+                {
+                    if (!System.IO.Path.IsPathRooted(configured))
+                        configured = System.IO.Path.Combine(AssemblyDir(), configured);
+                    return System.IO.File.Exists(configured) ? configured : null;
+                }
+                catch { return null; }
+            }
+
+            private static string AssemblyDir()
             {
                 // Âncora na pasta do PRÓPRIO assembly, não em AppDomain.BaseDirectory: quando outro processo carrega o
                 // WindBot (teste por reflexão, host embutido), o BaseDirectory é o do hospedeiro e a busca partiria do
@@ -5806,6 +6097,19 @@ namespace WindBot.Game.AI.Decks
                 catch { }
                 if (string.IsNullOrEmpty(dir))
                     dir = AppDomain.CurrentDomain.BaseDirectory;
+                return dir;
+            }
+
+            // Busca legada, usada só quando SCRIPTZIP não está configurado: sobe no máximo 6 níveis a partir da
+            // pasta do executável procurando o script.zip do cliente.
+            private static string Locate()
+            {
+                bool isConfigured;
+                string configured = ConfiguredPath(out isConfigured);
+                // Local explícito configurado é EXCLUSIVO: se não existir, não cai na busca ampla.
+                if (isConfigured)
+                    return configured;
+                string dir = AssemblyDir();
                 for (int level = 0; level < 6 && !string.IsNullOrEmpty(dir); ++level)
                 {
                     string direct = System.IO.Path.Combine(dir, "script.zip");
@@ -5838,6 +6142,9 @@ namespace WindBot.Game.AI.Decks
                 {
                     string path = Locate();
                     if (path == null) return;
+                    // Teto do arquivo no disco: recusa barata, antes de abrir (zip bomb não precisa ser grande,
+                    // por isso o teto de arquivo é só sanidade — quem segura o bomb é o limite por entrada).
+                    if (new System.IO.FileInfo(path).Length > MaxArchiveBytes) return;
                     // System.Type qualificado: "Type" sozinho resolveria para a propriedade Executor.Type da classe base.
                     // O nome do assembly precisa ser COMPLETO: com o nome curto, Type.GetType devolve null e
                     // Assembly.Load falha (medido em 2026-09-18). ZipFile/ZipArchive não estão em System.dll, por isso
@@ -5852,15 +6159,22 @@ namespace WindBot.Game.AI.Decks
                     _archive = openRead.Invoke(null, new object[] { path });
                     object entries = _archive.GetType().GetProperty("Entries").GetValue(_archive, null);
                     var map = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+                    int seen = 0;
+                    bool overflow = false;
                     foreach (object entry in (System.Collections.IEnumerable)entries)
                     {
+                        if (++seen > MaxEntries) { overflow = true; break; }
                         if (_openEntry == null)
+                        {
                             _openEntry = entry.GetType().GetMethod("Open", System.Type.EmptyTypes);
+                            _entryLength = entry.GetType().GetProperty("Length");
+                        }
                         string name = (string)entry.GetType().GetProperty("Name").GetValue(entry, null);
                         if (!string.IsNullOrEmpty(name) && name[0] == 'c' && name.EndsWith(".lua", StringComparison.OrdinalIgnoreCase))
                             map[name] = entry;
                     }
-                    _entries = _openEntry != null ? map : null;
+                    // Archive com contagem absurda é recusado por inteiro: não indexa nada.
+                    _entries = (_openEntry != null && !overflow) ? map : null;
                 }
                 catch
                 {
@@ -5882,9 +6196,34 @@ namespace WindBot.Game.AI.Decks
                     if (entry == null) return null;
                     try
                     {
+                        // Camada 1: tamanho declarado no cabeçalho do ZIP. Barato, mas confiável só se o cabeçalho
+                        // for honesto — por isso a camada 2 abaixo.
+                        if (_entryLength != null)
+                        {
+                            long declared = (long)_entryLength.GetValue(entry, null);
+                            if (declared > MaxEntryBytes) return null;
+                        }
                         using (var stream = (System.IO.Stream)_openEntry.Invoke(entry, null))
-                        using (var reader = new System.IO.StreamReader(stream))
-                            return reader.ReadToEnd();
+                        using (var payload = new System.IO.MemoryStream())
+                        {
+                            // Camada 2: mede os bytes que a stream entrega de fato. Um ZIP com cabeçalho mentindo
+                            // (declara pouco, entrega muito) estoura aqui e devolve null: o chamador cai no texto
+                            // em inglês, que é o mesmo caminho de "sem script". Nunca estoura MaxEntryBytes+o
+                            // tamanho do buffer por muito, então o tempo sob o Gate fica limitado.
+                            byte[] buffer = new byte[8192];
+                            int read;
+                            int total = 0;
+                            while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+                            {
+                                total += read;
+                                if (total > MaxEntryBytes) return null;
+                                payload.Write(buffer, 0, read);
+                            }
+                            // MemoryStream em vez de ler a stream direto: o teto garante que ReadToEnd é seguro.
+                            payload.Position = 0;
+                            using (var reader = new System.IO.StreamReader(payload))
+                                return reader.ReadToEnd();
+                        }
                     }
                     catch { return null; }
                 }
@@ -6106,6 +6445,28 @@ namespace WindBot.Game.AI.Decks
             }
         }
 
+        /// <summary>
+        /// Valores vivos de uma carta de fora durante a duel (nível/atributo/raça/tuner podem mudar por efeito).
+        /// Construído na leitura do estado e nunca mutado depois (as cópias do MemberwiseClone do RdaState compartilham
+        /// a referência só para leitura). Fica em RdaState.ForeignDynamic, nunca no cache estático RdaCards.All:
+        /// é uma tabela por-duel, então um efeito numa duel não vaza para a próxima.
+        /// </summary>
+        private sealed class ForeignLive
+        {
+            public readonly int Level;
+            public readonly CardAttribute Attribute;
+            public readonly CardRace Race;
+            public readonly bool Tuner;
+
+            public ForeignLive(int level, CardAttribute attribute, CardRace race, bool tuner)
+            {
+                Level = level;
+                Attribute = attribute;
+                Race = race;
+                Tuner = tuner;
+            }
+        }
+
         /// <summary>Lista de cartas conhecidas pelo modelo e grupos usados pelas regras.</summary>
         private static class RdaCards
         {
@@ -6240,17 +6601,47 @@ namespace WindBot.Game.AI.Decks
             // só na linha principal), então as buscas em andamento continuam lendo a cópia antiga sem conflito.
             private static volatile Dictionary<int, RdaCardInfo> _lookup = new Dictionary<int, RdaCardInfo>();
 
+            // Checar, inserir e publicar a nova cópia do _lookup acontecem sob um único lock: sem ele, dois registros
+            // simultâneos podiam ler a mesma tabela e o segundo republished uma cópia perdendo o primeiro. Add() do
+            // construtor estático fica fora do lock (o type initializer do CLR já serializa aquelas chamadas).
+            private static readonly object SyncLock = new object();
+
             /// <summary>
-            /// Monstro fora do nosso deck no nosso campo (ex.: Primal Being Token do Nibiru). Registrado na leitura do estado,
-            /// antes do planejamento (a busca em paralelo só lê). Retorna true se foi registrado agora.
+            /// Monstro fora do nosso deck no nosso campo (ex.: Primal Being Token do Nibiru). Registrado na leitura do
+            /// estado, antes do planejamento (a busca em paralelo só lê). A base (nível/atributo/raça/tuner/synchro)
+            /// vem do cards.cdb — mesma fonte de Name(), valores de impressão imutáveis; os valores vivos da duel
+            /// ficam em RdaState.ForeignDynamic, nunca aqui. Retorna true se foi registrado agora.
             /// </summary>
-            public static bool RegisterForeign(int id, string name, int level, CardAttribute attribute, CardRace race, bool tuner, bool synchro)
+            public static bool RegisterForeign(int id, string name)
             {
-                if (All.ContainsKey(id))
-                    return false;
-                All[id] = new RdaCardInfo(id, name, 'M', level, attribute, race, tuner: tuner, synchro: synchro, summonable: false, foreign: true);
-                _lookup = new Dictionary<int, RdaCardInfo>(All);
-                return true;
+                lock (SyncLock)
+                {
+                    if (All.ContainsKey(id))
+                        return false;
+                    int level = 0;
+                    CardAttribute attribute = 0;
+                    CardRace race = 0;
+                    bool tuner = false, synchro = false;
+                    try
+                    {
+                        YGOSharp.OCGWrapper.NamedCard data = YGOSharp.OCGWrapper.NamedCard.Get(id);
+                        if (data != null)
+                        {
+                            level = data.Level & 0xFF;
+                            attribute = (CardAttribute)data.Attribute;
+                            race = (CardRace)data.Race;
+                            tuner = data.HasType(CardType.Tuner);
+                            synchro = data.HasType(CardType.Synchro);
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        // Sem cards.cdb carregado (teste offline): fica a base vazia (nível 0), como antes.
+                    }
+                    All[id] = new RdaCardInfo(id, name, 'M', level, attribute, race, tuner: tuner, synchro: synchro, summonable: false, foreign: true);
+                    _lookup = new Dictionary<int, RdaCardInfo>(All);
+                    return true;
+                }
             }
 
             private static RdaCardInfo Extra(int id, string name, int level, bool tuner = false, bool mentionsRda = false)
@@ -6263,6 +6654,45 @@ namespace WindBot.Game.AI.Decks
             {
                 RdaCardInfo card;
                 return _lookup.TryGetValue(id, out card) ? card : null;
+            }
+
+            // Leituras por estado de uma carta possivelmente de fora: consultam o overlay vivo da duel (ForeignDynamic)
+            // e voltam ao modelo (base do cards.cdb, imutável) quando não há overlay. As cartas nossas nunca têm overlay,
+            // então o resultado é o mesmo de Get(...).<prop> — só a carta de fora ganha o valor vivo desta duel.
+            public static int Level(RdaState state, int id)
+            {
+                ForeignLive live;
+                if (state.ForeignDynamic != null && state.ForeignDynamic.TryGetValue(id, out live))
+                    return live.Level;
+                RdaCardInfo card = Get(id);
+                return card != null ? card.Level : 0;
+            }
+
+            public static CardAttribute Attribute(RdaState state, int id)
+            {
+                ForeignLive live;
+                if (state.ForeignDynamic != null && state.ForeignDynamic.TryGetValue(id, out live))
+                    return live.Attribute;
+                RdaCardInfo card = Get(id);
+                return card != null ? card.Attribute : 0;
+            }
+
+            public static CardRace Race(RdaState state, int id)
+            {
+                ForeignLive live;
+                if (state.ForeignDynamic != null && state.ForeignDynamic.TryGetValue(id, out live))
+                    return live.Race;
+                RdaCardInfo card = Get(id);
+                return card != null ? card.Race : 0;
+            }
+
+            public static bool Tuner(RdaState state, int id)
+            {
+                ForeignLive live;
+                if (state.ForeignDynamic != null && state.ForeignDynamic.TryGetValue(id, out live))
+                    return live.Tuner;
+                RdaCardInfo card = Get(id);
+                return card != null && card.Tuner;
             }
 
             public static string Name(int id)
@@ -6460,6 +6890,12 @@ namespace WindBot.Game.AI.Decks
             public int[] EnemyBanished = new int[0];  // monstros LIGHT/DARK banidos do oponente (alvos da Dis Pater ①)
             public int EnemyBanishedOther;            // outras cartas banidas do oponente (negação da Dis Pater ②)
             public int EnemyGravePriority;            // melhor alvo da Magnamhut no GY do oponente (efeito no GY, Extra, nível)
+            // Valores vivos das cartas de fora nesta leitura (ForeignLive por id): consultados pelas regras via
+            // RdaCards.Level/Attribute/Race/Tuner em vez do modelo estático. Null quando não há nenhuma. Fora do
+            // Equals/GetHashCode (mesmo motivo do lado inimigo: dentro de uma busca todos os estados derivam da mesma
+            // leitura) e nunca mutado depois de construído — as cópias do MemberwiseClone compartilham a referência
+            // apenas para leitura.
+            public Dictionary<int, ForeignLive> ForeignDynamic;
             // Entradas do turno (fora do Equals): Red Zone com a face para cima e sem negação (efeito ② disponível);
             // cópias de Red Rising Dragon no GY que não foram para lá neste turno (efeito do GY disponível).
             public bool RedZoneReady;
@@ -7097,12 +7533,12 @@ namespace WindBot.Game.AI.Decks
             /// forcedRace/forcedAttribute vêm do estado, lidos AO VIVO do ClientCard, e valem para todos os monstros
             /// do campo — que é como essas cartas funcionam.
             /// </summary>
-            private static bool SynchroRequirement(int target, List<long> tuners, List<long> nonTuners,
+            private static bool SynchroRequirement(RdaState state, int target, List<long> tuners, List<long> nonTuners,
                 CardRace forcedRace = 0, CardAttribute forcedAttribute = 0)
             {
                 Func<long, RdaCardInfo> card = m => C(RdaField.Id(m));
-                Func<long, CardRace> raceOf = m => forcedRace != 0 ? forcedRace : card(m).Race;
-                Func<long, CardAttribute> attrOf = m => forcedAttribute != 0 ? forcedAttribute : card(m).Attribute;
+                Func<long, CardRace> raceOf = m => forcedRace != 0 ? forcedRace : RdaCards.Race(state, RdaField.Id(m));
+                Func<long, CardAttribute> attrOf = m => forcedAttribute != 0 ? forcedAttribute : RdaCards.Attribute(state, RdaField.Id(m));
                 switch (target)
                 {
                     case RdaCards.Rda:
@@ -7199,7 +7635,7 @@ namespace WindBot.Game.AI.Decks
                             {
                                 if ((mask & (1 << i)) == 0) continue;
                                 long material = field[i];
-                                bool isTuner = C(RdaField.Id(material)).Tuner;
+                                bool isTuner = RdaCards.Tuner(state, RdaField.Id(material));
                                 if (RdaField.Id(material) == RdaCards.Zalen)
                                 {
                                     isTuner = (roles & (1 << flexibleIndex)) != 0;
@@ -7207,7 +7643,7 @@ namespace WindBot.Game.AI.Decks
                                 }
                                 (isTuner ? tuners : nonTuners).Add(material);
                             }
-                            valid = SynchroRequirement(target, tuners, nonTuners, state.ForcedRace, state.ForcedAttribute);
+                            valid = SynchroRequirement(state, target, tuners, nonTuners, state.ForcedRace, state.ForcedAttribute);
                         }
                         if (!valid) continue;
                         seen.Add(key);
@@ -7404,7 +7840,7 @@ namespace WindBot.Game.AI.Decks
                     if (state.EnemyGrave.Length > 0)
                     {
                         int target = Array.IndexOf(state.EnemyGrave, state.EnemyGravePriority) >= 0
-                            ? state.EnemyGravePriority : state.EnemyGrave.OrderByDescending(n => C(n).Level).First();
+                            ? state.EnemyGravePriority : state.EnemyGrave.OrderByDescending(n => RdaCards.Level(state, n)).First();
                         RdaState paid = state.Mark(RdaKey.MagnamhutSS);
                         paid.Hand = RdaArray.Remove(state.Hand, RdaCards.Magnamhut);
                         paid.EnemyGrave = RdaArray.Remove(state.EnemyGrave, target);
@@ -7552,7 +7988,7 @@ namespace WindBot.Game.AI.Decks
                 // ---- Darkness no campo: tuners escolhidos viram nível 1
                 if (!state.Uses(RdaKey.DarknessLevel) && state.Field.Any(m => RdaField.Id(m) == RdaCards.Darkness && !RdaField.Negated(m)))
                 {
-                    var tuners = state.Field.Where(m => C(RdaField.Id(m)).Tuner && RdaField.Level(m) > 1).ToList();
+                    var tuners = state.Field.Where(m => RdaCards.Tuner(state, RdaField.Id(m)) && RdaField.Level(m) > 1).ToList();
                     for (int mask = 1; mask < (1 << tuners.Count); ++mask)
                     {
                         RdaState changed = state.Mark(RdaKey.DarknessLevel);
@@ -7579,9 +8015,13 @@ namespace WindBot.Game.AI.Decks
                     if (crimson != 0)
                     {
                         var others = state.Field.Where(m => m != crimson).ToList();
-                        RdaCardInfo other = others.Count == 1 ? C(RdaField.Id(others[0])) : null;
-                        if (other != null && other.Synchro && other.Attribute == CardAttribute.Dark && other.Race == CardRace.Dragon)
-                            AddCrimsonEffect(moves, state);
+                        if (others.Count == 1)
+                        {
+                            int otherId = RdaField.Id(others[0]);
+                            if (C(otherId).Synchro && RdaCards.Attribute(state, otherId) == CardAttribute.Dark
+                                && RdaCards.Race(state, otherId) == CardRace.Dragon)
+                                AddCrimsonEffect(moves, state);
+                        }
                     }
                 }
 
@@ -7599,11 +8039,11 @@ namespace WindBot.Game.AI.Decks
                                 "Dis Pater summons " + N(target) + " from the banished zone", new RdaPick(target, CardLocation.Removed)), OnSummoned(placed, target)));
                     }
                     // Monstro banido do oponente: vem para o nosso campo (sem gatilhos nossos).
-                    foreach (int target in RdaArray.Distinct(state.EnemyBanished, n => C(n).Level > 0))
+                    foreach (int target in RdaArray.Distinct(state.EnemyBanished, n => RdaCards.Level(state, n) > 0))
                     {
                         RdaState removed = state.Mark(RdaKey.DisPaterEffect);
                         removed.EnemyBanished = RdaArray.Remove(state.EnemyBanished, target);
-                        RdaState placed = Place(removed, target, C(target).Level, false);
+                        RdaState placed = Place(removed, target, RdaCards.Level(state, target), false);
                         if (placed != null)
                             moves.Add(new RdaMove(Action(PlanKind.Activate, RdaCards.DisPater, CardLocation.MonsterZone, RdaKey.DisPaterEffect,
                                 "Dis Pater summons " + N(target) + " banished from the opponent", new RdaPick(target, CardLocation.Removed)), placed));
@@ -8375,7 +8815,7 @@ namespace WindBot.Game.AI.Decks
                 {
                     RdaCardInfo card = RdaCards.Get(RdaField.Id(monster));
                     if (card.Synchro) score += card.Level <= 10 ? 5 : 0;
-                    else score += card.Tuner ? 7 : 5;
+                    else score += RdaCards.Tuner(state, RdaField.Id(monster)) ? 7 : 5;
                 }
                 if (Array.IndexOf(state.Grave, RdaCards.Bone) >= 0 && !state.Uses(RdaKey.BoneSS)) score += 6;
                 if (Array.IndexOf(state.Grave, RdaCards.Lubellion) >= 0 && !state.Uses(RdaKey.LubellionSS)) score += 5;
@@ -8497,6 +8937,27 @@ namespace WindBot.Game.AI.Decks
             public int MaxDepth = 90;
             // Limite de segurança: medido fora do jogo, a carteira leva 10-15 s em paralelo; cortar antes piora a mesa.
             public int TimeLimitMs = 25000;
+            // Token de cancelamento do chamador (P4): a busca em segundo plano do turno clona as opções com um token próprio;
+            // quando a tarefa é cancelada, os Plan conferem Token nos pontos de checagem e param cedo. Buscas síncronas
+            // (replanejamento, testes offline) deixam CancellationToken.None e nunca são canceladas. As opções da carteira
+            // são estáticas e compartilhadas entre busca de fundo e replanejamento, então o Token nunca é gravado nelas:
+            // quem precisa dele clona com WithToken. Não usar Token como identidade da busca.
+            public CancellationToken Token;
+
+            // Cópia rasa com token de cancelamento desta chamada, sem tocar nos SearchOptions estáticos compartilhados.
+            // Ao adicionar um campo novo em SearchOptions, atualizar este clone.
+            public SearchOptions WithToken(CancellationToken value)
+            {
+                var copy = new SearchOptions
+                {
+                    Name = Name, Width = Width, PerRoute = PerRoute, OpeningDiversity = OpeningDiversity,
+                    DiversityShare = DiversityShare, CollectSeeds = CollectSeeds, BookWeight = BookWeight,
+                    Noise = Noise, Seed = Seed, ForbidUnprotectedNova = ForbidUnprotectedNova,
+                    ForbidNibiruExposed = ForbidNibiruExposed, MaxDepth = MaxDepth, TimeLimitMs = TimeLimitMs,
+                    Token = value
+                };
+                return copy;
+            }
         }
 
         /// <summary>Busca em feixe sobre as regras do modelo.</summary>
@@ -8651,6 +9112,42 @@ namespace WindBot.Game.AI.Decks
             // Mede quanto um cache compartilhado de jogadas economizaria. Nulo no jogo.
             public static System.Collections.Concurrent.ConcurrentDictionary<RdaState, int> ExpansionCounter = null; // teste offline (reflexão)
 
+            // Teto global de buscas Plan concorrentes (P4). Antes, um replanejamento síncrono durante a primeira busca do
+            // turno em segundo plano podia deixar a carteira (3 buscas) + rotas + iscas + resistência rodando ao mesmo tempo:
+            // até 10+ Plans competindo por CPU, cada um gastando o orçamento inteiro. O gate limita quantos Plans rodam de
+            // verdade; quem chega depois espera no Monitor e leave faz PulseAll. Não há deadlock por reentrada porque Plan
+            // é folha (não chama outro Plan dentro dele); os helpers paralelos chamam Plan e cada chamada entra/sai do
+            // gate por conta própria. Uma busca já cancelada que espera na fila é inofensiva: ao entrar, o primeiro ponto
+            // de checagem aborta em seguida e devolve a vaga.
+            private static readonly object SearchGateLock = new object();
+            private static int SearchGatePermits = System.Environment.ProcessorCount; // teste offline: reduz por reflexão
+            private static int SearchGateActive;
+            public static int SearchGateInUse
+            {
+                get { lock (SearchGateLock) { return SearchGateActive; } }
+            }
+
+            // Espera por uma vaga (quem cancelou a busca só sai esperando: ao entrar, o primeiro ponto de checagem do Plan
+            // vê o Token cancelado e devolve o melhor-so-far em seguida). Espera em blocos de 50 ms; leave faz PulseAll.
+            private static void SearchGateEnter()
+            {
+                lock (SearchGateLock)
+                {
+                    while (SearchGateActive >= SearchGatePermits)
+                        Monitor.Wait(SearchGateLock, 50);
+                    SearchGateActive++;
+                }
+            }
+
+            private static void SearchGateLeave()
+            {
+                lock (SearchGateLock)
+                {
+                    SearchGateActive--;
+                    Monitor.PulseAll(SearchGateLock);
+                }
+            }
+
             private static double PathCost(Node node)
             {
                 return ExposureWeight * node.Exposure + node.NibiruPenalty + DrawPenalty * node.DrawEvents
@@ -8758,6 +9255,8 @@ namespace WindBot.Game.AI.Decks
             };
 
             // Replaneja proibindo a abertura do melhor plano (a jogada que leva ao starter), para achar uma rota com outro starter.
+            // Obs. (P4): esta fase não é cancelável — a assinatura é chamada por testes offline via reflexão com 3 argumentos,
+            // então não pode ganhar um parâmetro de token; a busca interna fica limitada ao próprio TimeLimitMs (2,5 s).
             private static RdaPlan ForcedAlternative(RdaState root, RdaPlan best, ICollection<string> blocked)
             {
                 if (root.Pending.Length != 0 || best.Steps.Count == 0 || ResilienceWeight <= 0
@@ -8792,7 +9291,8 @@ namespace WindBot.Game.AI.Decks
                 return joined;
             }
 
-            private static RdaPlan ChooseResilient(RdaState root, IList<RdaPlan> plans, RdaPlan best)
+            private static RdaPlan ChooseResilient(RdaState root, IList<RdaPlan> plans, RdaPlan best,
+                CancellationToken token = default(CancellationToken))
             {
                 if (root.Pending.Length != 0 || root.HasFlag(RdaState.FlagMaxxC) || root.HasFlag(RdaState.FlagFuwalos) || ResilienceWeight <= 0)
                     return best;
@@ -8840,7 +9340,7 @@ namespace WindBot.Game.AI.Decks
                         fallbackScore[i] = plan.Score;
                         return;
                     }
-                    RdaPlan fallback = Plan(NegateBait(plan.Steps[index].After, plan.Steps[index].Action), BaitFallbackSearch, null);
+                    RdaPlan fallback = Plan(NegateBait(plan.Steps[index].After, plan.Steps[index].Action), BaitFallbackSearch.WithToken(token), null);
                     fallbackTier[i] = fallback.Tier;
                     fallbackScore[i] = fallback.Score;
                 });
@@ -8873,7 +9373,7 @@ namespace WindBot.Game.AI.Decks
                 public double FallbackScore = double.MinValue;
             }
 
-            private static void BaitFirst(RdaPlan plan)
+            private static void BaitFirst(RdaPlan plan, CancellationToken token = default(CancellationToken))
             {
                 if (plan == null || plan.Root == null || plan.Root.Pending.Length != 0 || plan.Steps.Count == 0
                     || plan.Root.HasFlag(RdaState.FlagBaitDone))
@@ -8916,7 +9416,7 @@ namespace WindBot.Game.AI.Decks
                     option.Negated = NegateBait(option.Steps[0].After, option.Steps[0].Action);
                 Parallel.For(0, options.Count, i =>
                 {
-                    RdaPlan fallback = Plan(options[i].Negated, BaitFallbackSearch, null);
+                    RdaPlan fallback = Plan(options[i].Negated, BaitFallbackSearch.WithToken(token), null);
                     options[i].FallbackTier = fallback.Tier;
                     options[i].FallbackScore = fallback.Score;
                 });
@@ -9228,6 +9728,9 @@ namespace WindBot.Game.AI.Decks
             /// <summary>Carteira: roda as buscas em paralelo e fica com a melhor mesa (camada primeiro, nota de seleção depois).</summary>
             public static RdaPlan PlanPortfolio(RdaState root, IList<SearchOptions> searches, ICollection<string> blockedRootActions)
             {
+                // Token de cancelamento desta execução da carteira: a busca de fundo do turno passa as opções já clonadas
+                // com o token (ver StartBackgroundPlan); o replanejamento síncrono usa as opções estáticas sem token (None).
+                CancellationToken token = searches.Count > 0 ? searches[0].Token : default(CancellationToken);
                 var watch = Stopwatch.StartNew();
                 // Rotas de referência (combos do jogador) só no primeiro plano do turno: encaixadas na mão pelas regras e
                 // completadas por uma busca curta. Se alguma chega à mesa ideal com o nova protegido, a carteira pesada é trocada
@@ -9241,7 +9744,7 @@ namespace WindBot.Game.AI.Decks
                 // rotas normais. Antes as rotas eram simplesmente desligadas sob Maxx "C".
                 var phase = Stopwatch.StartNew();
                 List<RdaPlan> guided = (blockedRootActions == null || blockedRootActions.Count == 0) && root.Pending.Length == 0
-                    ? GuidedPlans(root, firstPlan, maxx) : new List<RdaPlan>();
+                    ? GuidedPlans(root, firstPlan, maxx, token) : new List<RdaPlan>();
                 long msGuided = phase.ElapsedMilliseconds;
                 long msSearch = 0, msForced = 0, msResilient = 0, msShortcut = 0, msSeeds = 0;
                 RdaPlan bestGuided = guided.OrderBy(item => item.Tier).ThenByDescending(item => item.Score).FirstOrDefault();
@@ -9259,7 +9762,7 @@ namespace WindBot.Game.AI.Decks
                     var safe = new bool[idealRoutes.Count];
                     Parallel.For(0, idealRoutes.Count, i =>
                     {
-                        RdaPlan starterNegated = StarterFallback(idealRoutes[i]);
+                        RdaPlan starterNegated = StarterFallback(idealRoutes[i], token);
                         safe[i] = starterNegated == null || starterNegated.Tier <= 2 || starterNegated.Score >= RouteSafeFallbackScore;
                     });
                     shortcut = safe.Any(value => value);
@@ -9289,7 +9792,7 @@ namespace WindBot.Game.AI.Decks
                 IList<SearchOptions> effective = shortcut ? (IList<SearchOptions>)new[] { RouteVerifySearch, RouteVerifySearchProtected } : searches;
                 var plans = new RdaPlan[effective.Count];
                 phase.Restart();
-                Parallel.For(0, effective.Count, i => plans[i] = Plan(root, effective[i], blockedRootActions));
+                Parallel.For(0, effective.Count, i => plans[i] = Plan(root, effective[i].WithToken(token), blockedRootActions));
                 msSearch = phase.ElapsedMilliseconds;
                 var pool = new List<RdaPlan>(plans);
                 pool.AddRange(guided);
@@ -9301,7 +9804,7 @@ namespace WindBot.Game.AI.Decks
                 if (firstPlan && plans.Any(plan => plan.Seeds.Count > 0))
                 {
                     phase.Restart();
-                    List<RdaPlan> seeded = SeededPlans(root, plans, best);
+                    List<RdaPlan> seeded = SeededPlans(root, plans, best, token);
                     msSeeds = phase.ElapsedMilliseconds;
                     pool.AddRange(seeded);
                     best = pool.OrderBy(item => item.Tier).ThenByDescending(item => item.Score).First();
@@ -9321,7 +9824,7 @@ namespace WindBot.Game.AI.Decks
                         pool.Add(forced);
                 }
                 phase.Restart();
-                best = ChooseResilient(root, pool, best);
+                best = ChooseResilient(root, pool, best, token);
                 msResilient = phase.ElapsedMilliseconds;
                 // Droll & Lock Bird resolvido (jogador, 2026-09-16): a rota de referência tem preferência. Sob Droll sobram poucas
                 // cartas jogáveis, as mesas empatam em negações e a alternativa da busca só aguentava melhor a negação porque
@@ -9341,7 +9844,7 @@ namespace WindBot.Game.AI.Decks
                 // Isca só no primeiro plano do turno (jogador): é para puxar a negação enquanto a mesa está sendo montada.
                 // Nos recálculos do meio do combo a isca é dispensada; no turno seguinte o primeiro plano volta a considerar.
                 if (searches.Count >= 3)
-                    BaitFirst(best);
+                    BaitFirst(best, token);
                 DelaySummons(best);
                 best.ElapsedMs = watch.ElapsedMilliseconds;
                 // Perfil somado de todas as buscas que rodaram nesta carteira (inclui as rotas encaixadas). Serve para
@@ -10096,7 +10599,8 @@ namespace WindBot.Game.AI.Decks
                 return plan;
             }
 
-            private static RdaPlan RoutePlan(RdaState root, RouteGuide route, bool fromStart)
+            private static RdaPlan RoutePlan(RdaState root, RouteGuide route, bool fromStart,
+                CancellationToken token = default(CancellationToken))
             {
                 var follower = new RouteFollower { Route = route };
                 // Primeiro plano: a rota começa do primeiro passo. Replanejamento: o combo já andou, então tenta começar de cada passo.
@@ -10125,7 +10629,7 @@ namespace WindBot.Game.AI.Decks
                 onlyRoute.RouteComplete = follower.BestMatched == route.Steps.Length;
                 if (!fromStart)
                     return onlyRoute;
-                RdaPlan suffix = Plan(before, RouteFinishSearch, null);
+                RdaPlan suffix = Plan(before, RouteFinishSearch.WithToken(token), null);
                 RdaPlan finished = StitchPlan(root, name + " + search", prefix, exposure, unprotected, suffix);
                 finished.RouteComplete = onlyRoute.RouteComplete;
                 return finished.Tier < onlyRoute.Tier || (finished.Tier == onlyRoute.Tier && finished.Score > onlyRoute.Score) ? finished : onlyRoute;
@@ -10182,19 +10686,20 @@ namespace WindBot.Game.AI.Decks
             }
 
             // Mesa que sobra se o starter (1º efeito crítico) do plano for negado.
-            private static RdaPlan StarterFallback(RdaPlan plan)
+            private static RdaPlan StarterFallback(RdaPlan plan, CancellationToken token = default(CancellationToken))
             {
                 int index = plan.Steps.FindIndex(step => IsCriticalAction(step.Action));
                 if (index < 0)
                     return null;
-                return Plan(NegateBait(plan.Steps[index].After, plan.Steps[index].Action), BaitFallbackSearch, null);
+                return Plan(NegateBait(plan.Steps[index].After, plan.Steps[index].Action), BaitFallbackSearch.WithToken(token), null);
             }
 
-            private static List<RdaPlan> GuidedPlans(RdaState root, bool fromStart, bool maxx = false)
+            private static List<RdaPlan> GuidedPlans(RdaState root, bool fromStart, bool maxx = false,
+                CancellationToken token = default(CancellationToken))
             {
                 RouteGuide[] routes = RouteGuides.Where(route => route.ForMaxx == maxx).ToArray();
                 var results = new RdaPlan[routes.Length];
-                Parallel.For(0, routes.Length, i => results[i] = RoutePlan(root, routes[i], fromStart));
+                Parallel.For(0, routes.Length, i => results[i] = RoutePlan(root, routes[i], fromStart, token));
                 return results.Where(plan => plan != null && plan.Steps.Count > 0).ToList();
             }
 
@@ -10223,7 +10728,8 @@ namespace WindBot.Game.AI.Decks
                 return index < 0 ? RdaKey.None : plan.Steps[index].Action.Effect;
             }
 
-            private static List<RdaPlan> SeededPlans(RdaState root, IList<RdaPlan> plans, RdaPlan best)
+            private static List<RdaPlan> SeededPlans(RdaState root, IList<RdaPlan> plans, RdaPlan best,
+                CancellationToken token = default(CancellationToken))
             {
                 // Uma semente por starter + rota do livro; fora as que já estão no caminho do melhor plano. Rotas do livro (combos do
                 // jogador) primeiro, depois a prioridade.
@@ -10240,7 +10746,7 @@ namespace WindBot.Game.AI.Decks
                 Parallel.For(0, prefixes.Count, i =>
                 {
                     RdaPlan prefix = prefixes[i];
-                    RdaPlan suffix = Plan(prefix.Final, SeedSearch, null);
+                    RdaPlan suffix = Plan(prefix.Final, SeedSearch.WithToken(token), null);
                     if (suffix.Steps.Count == 0)
                         return;
                     var stitched = new RdaPlan
@@ -10265,6 +10771,19 @@ namespace WindBot.Game.AI.Decks
             // blockedRootActions: textos de ações que o jogo recusou no estado atual (não aparecem no menu).
             // Só valem para o primeiro passo; depois dele o estado já é outro.
             public static RdaPlan Plan(RdaState root, SearchOptions options, ICollection<string> blockedRootActions)
+            {
+                SearchGateEnter();
+                try
+                {
+                    return PlanGated(root, options, blockedRootActions);
+                }
+                finally
+                {
+                    SearchGateLeave();
+                }
+            }
+
+            private static RdaPlan PlanGated(RdaState root, SearchOptions options, ICollection<string> blockedRootActions)
             {
                 var watch = Stopwatch.StartNew();
                 var random = new Random(options.Seed);
@@ -10292,11 +10811,18 @@ namespace WindBot.Game.AI.Decks
 
                 var frontier = new List<Node> { rootNode };
                 int depth = 0;
+                // Contador para a checagem de tempo/cancelamento a cada bloco de avaliações (P4): o limite antigo só era
+                // conferido no fim da camada, então uma profundidade com feixe grande estourava o orçamento em segundos.
+                int timeCheckCount = 0;
                 for (; depth < options.MaxDepth; ++depth)
                 {
                     var candidates = new Dictionary<RdaState, Node>();
                     foreach (Node node in frontier)
                     {
+                        // Granularidade por nó na geração de jogadas: sair aqui para o mais cedo possível quando a busca
+                        // foi cancelada ou o limite estourou (a avaliação dos candidatos já colhidos ainda roda abaixo).
+                        if (options.Token.IsCancellationRequested || watch.ElapsedMilliseconds > options.TimeLimitMs)
+                            break;
                         phase.Restart();
                         List<RdaMove> successors = RdaRules.Successors(node.State);
                         if (ExpansionCounter != null)
@@ -10376,6 +10902,11 @@ namespace WindBot.Game.AI.Decks
                     var scored = new List<KeyValuePair<double, Node>>(candidates.Count);
                     foreach (Node node in candidates.Values)
                     {
+                        // Granularidade na avaliação: a cada 256 nós confere cancelamento/limite. Um feixe de 3000 estados
+                        // leva ~meio segundo para avaliar; dividir por blocos impede que isso vire segundos de estouro.
+                        if ((++timeCheckCount & 255) == 0
+                            && (options.Token.IsCancellationRequested || watch.ElapsedMilliseconds > options.TimeLimitMs))
+                            break;
                         double evaluation = RdaEvaluator.Evaluate(node.State);
                         if (node.State.Pending.Length == 0)
                         {
@@ -10484,7 +11015,7 @@ namespace WindBot.Game.AI.Decks
                         }
                     }
                     ticksSort += phase.ElapsedTicks;
-                    if (watch.ElapsedMilliseconds > options.TimeLimitMs)
+                    if (options.Token.IsCancellationRequested || watch.ElapsedMilliseconds > options.TimeLimitMs)
                         break;
                 }
 
