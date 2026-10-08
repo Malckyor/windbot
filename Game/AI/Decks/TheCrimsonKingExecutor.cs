@@ -393,6 +393,7 @@ namespace WindBot.Game.AI.Decks
             : base(ai, duel)
         {
             ApplyDecisionMode();
+            HookConnectionEnd();
             // A ordem dos AddExecutor é a prioridade.
 
             // 0) Preparação do menu: roda antes de tudo no idle e sempre retorna false (nunca termina o turno).
@@ -646,12 +647,28 @@ namespace WindBot.Game.AI.Decks
             base.OnNewTurn();
         }
 
-        public override void OnDuelEnd()
+        // Fim do duelo sem hook dedicado: o Executor do WindBot oficial não declara OnDuelEnd (nem o chamaria), então
+        // o cancelamento observa o fim da conexão, que existe nas duas versões. O GameBehavior fecha a conexão ao
+        // receber o resultado do duelo e o evento é disparado pelo próprio Tick logo em seguida — mesmo instante em
+        // que o hook da versão modificada agia. Qualquer busca em segundo plano ainda rodando não tem mais sentido e
+        // só ocuparia CPU até terminar o orçamento (P4).
+        private void HookConnectionEnd()
         {
-            // Fim do duelo: qualquer busca em segundo plano ainda rodando não tem mais sentido e só ocuparia CPU
-            // enquanto o processo se prepara para a próxima partida (P4).
+            try
+            {
+                if (AI != null && AI.Game != null && AI.Game.Connection != null)
+                    AI.Game.Connection.Disconnected += OnConnectionDisconnected;
+            }
+            catch (Exception)
+            {
+                // Sem conexão observável o cancelamento continua valendo nos outros pontos
+                // (OnNewTurn, limite de replan, descarte do plano em TakeBackgroundPlan...).
+            }
+        }
+
+        private void OnConnectionDisconnected(Exception error)
+        {
             CancelBackgroundPlan();
-            base.OnDuelEnd();
         }
 
         public override void OnNewPhase()
